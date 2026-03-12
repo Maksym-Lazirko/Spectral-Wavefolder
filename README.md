@@ -1,4 +1,4 @@
-**A creative spectral wavefolder plugin** inspired by classic Buchla & Serge wavefolders, with extra modes for modern sound design.
+**World's first spectral wavefolder plugin** inspired by classic Buchla & Serge wavefolders, with extra modes for modern sound design. Free under MIT lisence!
 <img width="1092" height="449" alt="image" src="https://github.com/user-attachments/assets/c1c91eee-cbc1-4db5-a0ae-11b942f60b46" />
 ## 🎛️ Overview
 
