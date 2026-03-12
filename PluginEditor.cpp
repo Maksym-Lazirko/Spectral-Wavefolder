@@ -1,99 +1,115 @@
 #include "PluginEditor.h"
 #include "PluginProcessor.h"
 
-static void configureSlider (juce::Slider& s)
+SpectralWavefolderAudioProcessorEditor::SpectralWavefolderAudioProcessorEditor(
+    SpectralWavefolderAudioProcessor& p)
+    : juce::AudioProcessorEditor(&p), processor(p),
+    laf(std::make_unique<SWLookAndFeel>())
 {
-    s.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
-    s.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 72, 20);
+    setLookAndFeel(laf.get());
+    setResizable(true, false);
+    setResizeLimits(480, 200, 1400, 600);
+
+    addAndMakeVisible(panelFold);
+    addAndMakeVisible(panelOutput);
+
+    drive.init(this, *laf, "Drive");
+    threshold.init(this, *laf, "Threshold");
+    mix.init(this, *laf, "Mix");
+    tilt.init(this, *laf, "Tilt");
+    dynTrack.init(this, *laf, "Dynamics");
+    outGain.init(this, *laf, "Out Gain");
+    width.init(this, *laf, "Stereo Width");
+
+    modeLabel.setText("MODE", juce::dontSendNotification);
+    modeLabel.setFont(juce::Font(juce::FontOptions().withHeight(9.5f)));
+    modeLabel.setColour(juce::Label::textColourId, SWC::TEXTDIM);
+    modeBox.setLookAndFeel(laf.get());
+    modeBox.addItem("Buchla (parallel)", 1);
+    modeBox.addItem("Serge (series)", 2);
+    modeBox.addItem("Peak clip", 3);
+    modeBox.addItem("Center fold", 4);   // renamed, behaviour unchanged
+    modeBox.addItem("Fractal fold", 5);
+    modeBox.addItem("Wavewrap", 6);
+    modeBox.addItem("Tri fold", 7);   // new mode 6 (0-indexed)
+    addAndMakeVisible(modeLabel);
+    addAndMakeVisible(modeBox);
+
+    // Delta toggle button
+    deltaBtn.setButtonText("Delta");
+    deltaBtn.setLookAndFeel(laf.get());
+    addAndMakeVisible(deltaBtn);
+
+    auto& ap = processor.parameters;
+    attDrive = std::make_unique<SA>(ap, "drive", drive.slider);
+    attThresh = std::make_unique<SA>(ap, "threshold", threshold.slider);
+    attMix = std::make_unique<SA>(ap, "mix", mix.slider);
+    attTilt = std::make_unique<SA>(ap, "tilt", tilt.slider);
+    attDyn = std::make_unique<SA>(ap, "dyntrack", dynTrack.slider);
+    attOutGain = std::make_unique<SA>(ap, "outgain", outGain.slider);
+    attWidth = std::make_unique<SA>(ap, "width", width.slider);
+    attMode = std::make_unique<CA>(ap, "mode", modeBox);
+    attDelta = std::make_unique<
+        juce::AudioProcessorValueTreeState::ButtonAttachment>(ap, "delta", deltaBtn);
+
+    setSize(620, 220);
 }
 
-SpectralWavefolderAudioProcessorEditor::SpectralWavefolderAudioProcessorEditor (SpectralWavefolderAudioProcessor& p)
-    : juce::AudioProcessorEditor (&p), processor (p)
+SpectralWavefolderAudioProcessorEditor::~SpectralWavefolderAudioProcessorEditor()
 {
-    configureSlider (drive);
-    configureSlider (threshold);
-    configureSlider (mix);
-
-    modeBox.addItem("Buchla-style (parallel)", 1);
-    modeBox.addItem("Serge-style (series)", 2);
-    modeBox.addItem("Peak-clipping", 3);
-    modeBox.addItem("Center-clipping", 4);
-    modeBox.addItem("Fractal folding", 5);
-    modeBox.addItem("Wavewrapper", 6);
-
-    oversampleBox.addItem("None", 1);
-    oversampleBox.addItem("2x", 2);
-    oversampleBox.addItem("4x", 3);
-
-    oversampleLabel.setText("Oversample", juce::dontSendNotification);
-
-    modeLabel.setText("Mode", juce::dontSendNotification);
-
-    driveLabel.setText ("Drive", juce::dontSendNotification);
-    thresholdLabel.setText ("Threshold", juce::dontSendNotification);
-    mixLabel.setText ("Mix", juce::dontSendNotification);
-
-    for (auto* l : { &driveLabel, &thresholdLabel, &mixLabel })
-        l->setJustificationType (juce::Justification::centred);
-
-    addAndMakeVisible (drive);
-    addAndMakeVisible (threshold);
-    addAndMakeVisible (mix);
-    addAndMakeVisible (modeBox);
-    addAndMakeVisible (oversampleBox);
-
-    addAndMakeVisible (driveLabel);
-    addAndMakeVisible (thresholdLabel);
-    addAndMakeVisible (mixLabel);
-    addAndMakeVisible (modeLabel);
-    addAndMakeVisible (oversampleLabel);
-
-    driveAttachment     = std::make_unique<Attachment> (processor.parameters, "drive", drive);
-    thresholdAttachment = std::make_unique<Attachment> (processor.parameters, "threshold", threshold);
-    mixAttachment       = std::make_unique<Attachment> (processor.parameters, "mix", mix);
-    modeAttachment      = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(processor.parameters, "mode", modeBox);
-    oversampleAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(processor.parameters, "oversample", oversampleBox);
-
-    setSize (480, 220);
+    attDrive.reset(); attThresh.reset(); attMix.reset();
+    attTilt.reset();  attDyn.reset();    attOutGain.reset();
+    attWidth.reset(); attMode.reset();   attDelta.reset();
+    setLookAndFeel(nullptr);
 }
 
-void SpectralWavefolderAudioProcessorEditor::paint (juce::Graphics& g)
+void SpectralWavefolderAudioProcessorEditor::paint(juce::Graphics& g)
 {
-    g.fillAll (juce::Colours::black);
-    g.setColour (juce::Colours::white);
-    g.setFont (15.0f);
-    g.drawFittedText ("Spectral Wavefolder", getLocalBounds().removeFromTop (26), juce::Justification::centred, 1);
+    g.fillAll(SWC::BG);
+    g.setColour(SWC::PANEL);
+    g.fillRect(0, 0, getWidth(), 30);
+    g.setColour(SWC::ACCENT.withAlpha(0.6f));
+    g.fillRect(0, 28, getWidth(), 2);
+    g.setColour(SWC::TEXT);
+    g.setFont(juce::Font(juce::FontOptions().withHeight(13.f).withStyle("Bold")));
+    g.drawText("SPECTRAL WAVEFOLDER", 12, 0, 300, 30, juce::Justification::centredLeft);
+    g.setColour(SWC::TEXTDIM);
+    g.setFont(juce::Font(juce::FontOptions().withHeight(9.5f)));
+    g.drawText("Lazirko Records", getWidth() - 110, 0, 102, 30,
+        juce::Justification::centredRight);
 }
 
 void SpectralWavefolderAudioProcessorEditor::resized()
 {
-    auto area = getLocalBounds().reduced (16);
-    area.removeFromTop (28);
+    auto area = getLocalBounds();
+    area.removeFromTop(32);
+    area.reduce(6, 6);
 
-    auto row = area.removeFromTop (area.getHeight());
-    auto w = row.getWidth() / 4;
-
-    auto c1 = row.removeFromLeft (w);
-    auto c2 = row.removeFromLeft (w);
-    auto c3 = row.removeFromLeft (w);
-    auto c4 = row;
-
-    auto place = [] (juce::Rectangle<int> r, juce::Slider& s, juce::Label& l)
+    //--- Right: output panel ----------------------------------------------------
+    auto outCol = area.removeFromRight(140);
+    panelOutput.setBounds(outCol);
     {
-        l.setBounds (r.removeFromTop (20));
-        s.setBounds (r.reduced (6));
-    };
+        auto inner = outCol.reduced(8, 18);
+        modeLabel.setBounds(inner.removeFromTop(13));
+        modeBox.setBounds(inner.removeFromTop(22).reduced(0, 1));
+        inner.removeFromTop(4);
+        deltaBtn.setBounds(inner.removeFromTop(20));   // Delta checkbox
+        inner.removeFromTop(4);
+        const int halfH = inner.getHeight() / 2;
+        outGain.setBounds(inner.removeFromTop(halfH));
+        width.setBounds(inner);
+    }
+    area.removeFromRight(4);
 
-    place (c1, drive, driveLabel);
-    place (c2, threshold, thresholdLabel);
-    place (c3, mix, mixLabel);
-    // place mode combobox and oversample combobox under their labels manually
-    auto top = c4.removeFromTop (c4.getHeight() / 2);
-    modeLabel.setBounds (top.removeFromTop (20));
-    modeBox.setBounds (top.reduced (6));
-
-    auto bot = c4;
-    oversampleLabel.setBounds (bot.removeFromTop (20));
-    oversampleBox.setBounds (bot.reduced (6));
+    //--- Left/centre: fold panel ------------------------------------------------
+    panelFold.setBounds(area);
+    {
+        auto inner = area.reduced(8, 18);
+        const int w = inner.getWidth() / 5;
+        drive.setBounds(inner.removeFromLeft(w));
+        threshold.setBounds(inner.removeFromLeft(w));
+        mix.setBounds(inner.removeFromLeft(w));
+        tilt.setBounds(inner.removeFromLeft(w));
+        dynTrack.setBounds(inner);
+    }
 }
-

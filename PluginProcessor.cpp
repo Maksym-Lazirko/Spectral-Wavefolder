@@ -4,404 +4,300 @@
 SpectralWavefolderAudioProcessor::SpectralWavefolderAudioProcessor()
     : juce::AudioProcessor(BusesProperties()
         .withInput("Input", juce::AudioChannelSet::stereo(), true)
-        .withInput("Sidechain", juce::AudioChannelSet::stereo(), true)
         .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
     parameters(*this, nullptr, "PARAMS", createParameterLayout())
 {
 }
 
-juce::AudioProcessorValueTreeState::ParameterLayout SpectralWavefolderAudioProcessor::createParameterLayout()
+juce::AudioProcessorValueTreeState::ParameterLayout
+SpectralWavefolderAudioProcessor::createParameterLayout()
 {
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
 
-    // Drive: 0.1 to 10.0, default 0.5, skewed toward lower values
     layout.add(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID("drive", 1),
-        "Drive",
-        juce::NormalisableRange<float>(0.1f, 10.0f, 0.01f, 0.5f),
-        0.5f));
-
-    // Threshold: 0.1 to 1.0, default 0.5, controls fold boundary
+        juce::ParameterID{ "drive", 1 }, "Drive",
+        juce::NormalisableRange<float>(0.1f, 10.0f, 0.01f, 0.33f), 1.0f));
     layout.add(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID("threshold", 1),
-        "Threshold",
-        juce::NormalisableRange<float>(0.1f, 1.0f, 0.001f, 1.0f),
-        0.5f));
-
-    // Mix: 0.0 to 1.0
+        juce::ParameterID{ "threshold", 1 }, "Threshold",
+        juce::NormalisableRange<float>(0.05f, 1.0f, 0.001f, 1.0f), 0.5f));
     layout.add(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID("mix", 1),
-        "Mix",
-        juce::NormalisableRange<float>(0.0f, 1.0f, 0.0001f, 1.0f),
-        1.0f));
-
-    // Mode selection
+        juce::ParameterID{ "mix", 1 }, "Mix",
+        juce::NormalisableRange<float>(0.0f, 1.0f, 0.001f, 1.0f), 1.0f));
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        juce::ParameterID{ "tilt", 1 }, "Tilt",
+        juce::NormalisableRange<float>(-1.0f, 1.0f, 0.001f, 1.0f), 0.0f));
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        juce::ParameterID{ "dyntrack", 1 }, "Dynamics",
+        juce::NormalisableRange<float>(0.0f, 0.7f, 0.001f, 1.0f), 0.0f));
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        juce::ParameterID{ "outgain", 1 }, "Out Gain",
+        juce::NormalisableRange<float>(-24.0f, 12.0f, 0.1f, 1.0f), 0.0f));
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        juce::ParameterID{ "width", 1 }, "Stereo Width",
+        juce::NormalisableRange<float>(-0.5f, 0.5f, 0.001f, 1.0f), 0.0f));
     layout.add(std::make_unique<juce::AudioParameterInt>(
-        juce::ParameterID("mode", 1),
-        "Mode",
-        0, 5, 0));
-
-    // Oversampling: 0 = none, 1 = 2x, 2 = 4x
-    layout.add(std::make_unique<juce::AudioParameterInt>(
-        juce::ParameterID("oversample", 1),
-        "Oversample",
-        0, 2, 0));
+        juce::ParameterID{ "mode", 1 }, "Mode", 0, 6, 0));
+    layout.add(std::make_unique<juce::AudioParameterBool>(
+        juce::ParameterID{ "delta", 1 }, "Delta", false));
 
     return layout;
 }
 
 void SpectralWavefolderAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
-    juce::ignoreUnused(samplesPerBlock);
+    fs = static_cast<float>(sampleRate);
+    const int numCh = juce::jmax(1, getTotalNumOutputChannels());
 
-    // initialize per-channel DC filters
-    dcFilters.assign((int)getTotalNumOutputChannels(), 0.0f);
-    // initialize oversampling object lazily in processBlock when needed
-    oversampling.reset();
+    dcCoeff = std::exp(-2.0f * juce::MathConstants<float>::pi * 5.0f / fs);
+    rmsCoeff = std::exp(-1.0f / (fs * 0.020f));
+    tiltG = std::tan(juce::MathConstants<float>::pi * 1000.0f / fs);
+
+    ch.assign(static_cast<size_t>(numCh), ChannelState{});
+    dryBuf.setSize(numCh, samplesPerBlock, false, true, true);
+
+    const double ramp = 0.020;
+    for (auto* s : { &smDrive, &smThresh, &smMix, &smTilt, &smDynTrack,
+                     &smOutGain, &smWidth })
+        s->reset(sampleRate, ramp);
+
+    auto latch = [&](SV& sv, const char* id)
+        { sv.setCurrentAndTargetValue(*parameters.getRawParameterValue(id)); };
+    latch(smDrive, "drive");
+    latch(smThresh, "threshold");
+    latch(smMix, "mix");
+    latch(smTilt, "tilt");
+    latch(smDynTrack, "dyntrack");
+    latch(smOutGain, "outgain");
+    latch(smWidth, "width");
 }
+
+void SpectralWavefolderAudioProcessor::releaseResources() {}
 
 bool SpectralWavefolderAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
 {
-    const auto mainOut = layouts.getMainOutputChannelSet();
-    if (mainOut != juce::AudioChannelSet::mono() && mainOut != juce::AudioChannelSet::stereo())
+    const auto out = layouts.getMainOutputChannelSet();
+    if (out != juce::AudioChannelSet::mono() && out != juce::AudioChannelSet::stereo())
         return false;
-    if (layouts.getMainInputChannelSet() != mainOut)
+    if (layouts.getMainInputChannelSet() != out)
         return false;
     return true;
 }
 
-float SpectralWavefolderAudioProcessor::foldSample(float x, float thr) noexcept
+float SpectralWavefolderAudioProcessor::applyFoldMode(float x, float thr, int mode) noexcept
 {
-    if (thr <= 0.0f) return x;
+    if (thr < 1.0e-6f) return 0.0f;
+    switch (mode)
+    {
+    case 0:
+        return buchlaFold(x, thr);
 
-    // Fold non-negative magnitudes into [0, thr] using a triangular fold
-    // period = 2 * thr, fold back into range
-    const float period = 2.0f * thr;
-    float y = std::fmod(x, period);
-    if (y < 0.0f) y += period;
+    case 1:
+    {
+        float v = sergeCell(x, thr);
+        v = iterFold(v, thr);
+        v = sergeCell(v, thr);
+        v = iterFold(v, thr);
+        v = sergeCell(v, thr);
+        v = iterFold(v, thr);
+        v = sergeCell(v, thr);
+        return iterFold(v, thr);
+    }
 
-    if (y <= thr)
-        return y;
-    else
-        return 2.0f * thr - y;
+    case 2:
+        return juce::jlimit(-thr, thr, x);
+
+    case 3:
+        if (std::fabsf(x) <= thr) return 0.0f;
+        return (x > 0.0f) ? (x - thr) : (x + thr);
+
+    case 4:
+    {
+        float acc = 0.0f, t = thr;
+        for (int st = 0; st < 5; ++st) { acc += iterFold(x, t); t *= 0.5f; }
+        return acc * 0.2f;
+    }
+
+    case 5:
+        return (x > thr) ? (2.0f * thr - x) : x;
+
+    case 6: // Tri fold — gentle piecewise-linear fold, triangle-ish spectrum
+    {
+        float acc = 0.0f, t = thr;
+        for (int st = 0; st < 3; ++st) { acc += iterFold(x, t); t *= 0.5f; }
+        acc /= 3.0f;
+        return 0.6f * x + 0.4f * acc;
+    }
+
+    default:
+        return iterFold(x, thr);
+    }
 }
 
-void SpectralWavefolderAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
+static inline void tpt1LP(float x, float g, float& s1,
+    float& yLp, float& yHp) noexcept
+{
+    const float v = g * (x - s1) / (1.0f + g);
+    yLp = v + s1;
+    s1 += 2.0f * v;
+    yHp = x - yLp;
+}
+
+void SpectralWavefolderAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
+    juce::MidiBuffer& midi)
 {
     juce::ignoreUnused(midi);
+    juce::ScopedNoDenormals noDenormals;
 
-    const auto totalNumInputChannels = getTotalNumInputChannels();
-    const auto totalNumOutputChannels = getTotalNumOutputChannels();
+    const int totalIn = getTotalNumInputChannels();
+    const int totalOut = getTotalNumOutputChannels();
+    const int numSamp = buffer.getNumSamples();
+    const int numCh = juce::jmin(buffer.getNumChannels(), totalOut);
 
-    for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
-        buffer.clear(i, 0, buffer.getNumSamples());
+    for (int i = totalIn; i < totalOut; ++i)
+        buffer.clear(i, 0, numSamp);
+    if (numCh == 0 || numSamp == 0) return;
 
-    const float drive = *parameters.getRawParameterValue("drive");
-    const float threshold = *parameters.getRawParameterValue("threshold");
-    const int mode = int(*parameters.getRawParameterValue("mode"));
-    const float mix = *parameters.getRawParameterValue("mix");
+    smDrive.setTargetValue(*parameters.getRawParameterValue("drive"));
+    smThresh.setTargetValue(*parameters.getRawParameterValue("threshold"));
+    smMix.setTargetValue(*parameters.getRawParameterValue("mix"));
+    smTilt.setTargetValue(*parameters.getRawParameterValue("tilt"));
+    smDynTrack.setTargetValue(*parameters.getRawParameterValue("dyntrack"));
+    smOutGain.setTargetValue(*parameters.getRawParameterValue("outgain"));
+    smWidth.setTargetValue(*parameters.getRawParameterValue("width"));
 
-    const int numSamples = buffer.getNumSamples();
-    const int numChannels = buffer.getNumChannels();
+    const int   mode = static_cast<int>  (*parameters.getRawParameterValue("mode"));
+    const bool  deltaOn = *parameters.getRawParameterValue("delta") > 0.5f;
+    const float drive0 = smDrive.getCurrentValue();
+    const float thr0 = smThresh.getCurrentValue();
+    const float dynTrk0 = smDynTrack.getCurrentValue();
+    const float modeNorm = kModeRmsInv[juce::jlimit(0, 6, mode)] / juce::jmax(0.01f, drive0);
+    const bool  stereo = (numCh == 2);
 
-    // check oversample parameter (0 = none, 1 = 2x, 2 = 4x)
-    const int overs = int(*parameters.getRawParameterValue("oversample"));
-    const int factor = (overs == 1) ? 2 : (overs == 2) ? 4 : 1;
+    if (dryBuf.getNumSamples() < numSamp || dryBuf.getNumChannels() < numCh)
+        dryBuf.setSize(numCh, numSamp, false, true, true);
 
-    // keep a dry copy for mixing
-    juce::AudioBuffer<float> dry;
-    dry.makeCopyOf(buffer);
+    // STEP 1 — capture dry
+    for (int c = 0; c < numCh; ++c)
+        dryBuf.copyFrom(c, 0, buffer, c, 0, numSamp);
 
-    if (factor <= 1)
+    // STEP 2 — RMS for dynamics
+    for (int c = 0; c < numCh; ++c)
     {
-        // no oversampling: process in-place
-        for (int ch = 0; ch < numChannels; ++ch)
+        auto& cs = ch[static_cast<size_t>(c)];
+        const float* src = buffer.getReadPointer(c);
+        for (int i = 0; i < numSamp; ++i)
+            cs.rmsEnv = rmsCoeff * cs.rmsEnv + (1.0f - rmsCoeff) * (src[i] * src[i]);
+    }
+
+    auto effDrive = [&](size_t ci) -> float
         {
-            auto* data = buffer.getWritePointer(ch);
-            float& dcFilter = dcFilters[size_t(ch)];
+            const float amp = std::sqrtf(juce::jmin(ch[ci].rmsEnv, 1.0f));
+            return drive0 * (1.0f + dynTrk0 * amp * 3.0f);
+        };
 
-            for (int i = 0; i < numSamples; ++i)
+    // STEP 3 — M/S encode
+    if (stereo)
+    {
+        float* L = buffer.getWritePointer(0);
+        float* R = buffer.getWritePointer(1);
+        for (int i = 0; i < numSamp; ++i)
+        {
+            const float m = (L[i] + R[i]) * 0.5f;
+            const float s = (L[i] - R[i]) * 0.5f;
+            L[i] = m; R[i] = s;
+        }
+    }
+
+    // STEP 4 — wideband fold
+    for (int c = 0; c < numCh; ++c)
+    {
+        float* data = buffer.getWritePointer(c);
+        const float eff = effDrive(static_cast<size_t>(c));
+        for (int i = 0; i < numSamp; ++i)
+            data[i] = applyFoldMode(data[i] * eff, thr0, mode) * modeNorm;
+    }
+
+    // STEP 5 — tilt, DC block, soft-limit, output gain
+    for (int c = 0; c < numCh; ++c)
+    {
+        float* data = buffer.getWritePointer(c);
+        auto& cs = ch[static_cast<size_t>(c)];
+        const bool isLead = (c == 0);
+        for (int i = 0; i < numSamp; ++i)
+        {
+            const float tv = isLead ? smTilt.getNextValue() : smTilt.getCurrentValue();
+            const float gLin = juce::Decibels::decibelsToGain(
+                isLead ? smOutGain.getNextValue() : smOutGain.getCurrentValue());
+            if (isLead)
             {
-                float x = data[i];
-                x *= drive;
-
-                float y = x;
-
-                // folding modes (same as before)
-                switch (mode)
-                {
-                    case 0: // Buchla-style parallel
-                    {
-                        const int stages = 3;
-                        float acc = 0.0f;
-                        float s = 1.0f;
-                        for (int st = 0; st < stages; ++st)
-                        {
-                            const float thr = threshold * s;
-                            float folded = x;
-                            if (thr > 0.0f)
-                            {
-                                float pos = std::fmod(folded + thr, 2.0f * thr);
-                                if (pos < 0.0f) pos += 2.0f * thr;
-                                if (pos <= thr) folded = pos - thr;
-                                else folded = 3.0f * thr - pos;
-                            }
-                            acc += folded;
-                            s *= 2.0f;
-                        }
-                        y = acc / float(stages);
-                        break;
-                    }
-                    case 1: // Serge-style series
-                    {
-                        const int stages = 4;
-                        float v = x;
-                        for (int st = 0; st < stages; ++st)
-                        {
-                            if (threshold > 0.0f)
-                            {
-                                float pos = std::fmod(v + threshold, 2.0f * threshold);
-                                if (pos < 0.0f) pos += 2.0f * threshold;
-                                if (pos <= threshold) v = pos - threshold;
-                                else v = 3.0f * threshold - pos;
-                            }
-                        }
-                        y = v;
-                        break;
-                    }
-                    case 2: // Peak-clipping
-                        y = juce::jlimit(-threshold, threshold, x);
-                        break;
-                    case 3: // Center-clipping
-                    {
-                        float off = std::fabs(x);
-                        y = (off > threshold) ? x : -x;
-                        break;
-                    }
-                    case 4: // Fractal folding
-                    {
-                        float v = x;
-                        float s = 1.0f;
-                        for (int st = 0; st < 5; ++st)
-                        {
-                            float thr = threshold * s;
-                            if (thr > 0.0f)
-                            {
-                                float pos = std::fmod(v + thr, 2.0f * thr);
-                                if (pos < 0.0f) pos += 2.0f * thr;
-                                if (pos <= thr) v = pos - thr;
-                                else v = 3.0f * thr - pos;
-                            }
-                            s *= 0.5f;
-                        }
-                        y = v;
-                        break;
-                    }
-                    case 5: // Wavewrapper
-                    {
-                        if (threshold > 0.0f)
-                        {
-                            float m = std::fmod(x + threshold, 2.0f * threshold);
-                            if (m < 0.0f) m += 2.0f * threshold;
-                            y = m - threshold;
-                        }
-                        else y = x;
-                        break;
-                    }
-                    default:
-                    {
-                        if (threshold > 0.0f)
-                        {
-                            float pos = std::fmod(x + threshold, 2.0f * threshold);
-                            if (pos < 0.0f) pos += 2.0f * threshold;
-                            if (pos <= threshold) y = pos - threshold;
-                            else y = 3.0f * threshold - pos;
-                        }
-                    }
-                }
-
-                float out = (1.0f - mix) * dry.getSample(ch, i) + mix * y;
-
-                const float dcCoeff = 0.995f;
-                dcFilter = dcCoeff * dcFilter + out;
-                out -= dcFilter * (1.0f - dcCoeff);
-
-                data[i] = out;
+                smDrive.getNextValue(); smThresh.getNextValue();
+                smMix.getNextValue();   smDynTrack.getNextValue();
+                smWidth.getNextValue();
             }
+            float out = data[i];
+            float yLp, yHp;
+            tpt1LP(out, tiltG, cs.tilt.s1, yLp, yHp);
+            out = yLp * (1.0f - tv) + yHp * (1.0f + tv);
+            const float dcY = dcCoeff * (cs.dcOut + out - cs.dcPrev);
+            cs.dcPrev = out;
+            cs.dcOut = dcY;
+            out = dcY;
+            data[i] = softLimit(out) * gLin;
+        }
+    }
+
+    // STEP 6 — M/S decode + width
+    if (stereo)
+    {
+        const float sGain = 1.0f + smWidth.getCurrentValue();
+        float* M = buffer.getWritePointer(0);
+        float* S = buffer.getWritePointer(1);
+        for (int i = 0; i < numSamp; ++i)
+        {
+            const float m = M[i];
+            const float s = S[i] * sGain;
+            M[i] = m + s;
+            S[i] = m - s;
+        }
+    }
+
+    // STEP 7 — wet/dry blend (skipped when delta active)
+    if (!deltaOn)
+    {
+        const float mv = smMix.getCurrentValue();
+        const float dg = 1.0f - mv;
+        for (int c = 0; c < numCh; ++c)
+        {
+            float* wet = buffer.getWritePointer(c);
+            const float* dry = dryBuf.getReadPointer(c);
+            for (int i = 0; i < numSamp; ++i)
+                wet[i] = dg * dry[i] + mv * wet[i];
         }
     }
     else
     {
-        // oversampling path: simple linear upsampling + fold processing + box downsampling
-        const int upSamples = numSamples * factor;
-        juce::AudioBuffer<float> upBuf(numChannels, upSamples);
-
-        // upsample (linear interp)
-        for (int ch = 0; ch < numChannels; ++ch)
+        // STEP 8 — delta: output only the difference (processed - dry)
+        // buffer currently holds fully processed signal pre-blend
+        for (int c = 0; c < numCh; ++c)
         {
-            const float* in = dry.getReadPointer(ch);
-            float* up = upBuf.getWritePointer(ch);
-
-            for (int i = 0; i < numSamples - 1; ++i)
-            {
-                const float a = in[i];
-                const float b = in[i + 1];
-                for (int k = 0; k < factor; ++k)
-                {
-                    float t = float(k) / float(factor);
-                    up[i * factor + k] = a * (1.0f - t) + b * t;
-                }
-            }
-            // last sample: hold
-            const float last = in[numSamples - 1];
-            for (int k = 0; k < factor; ++k)
-                up[(numSamples - 1) * factor + k] = last;
-        }
-
-        // process upsampled buffer with same folding algorithm
-        for (int ch = 0; ch < numChannels; ++ch)
-        {
-            float* up = upBuf.getWritePointer(ch);
-
-            for (int i = 0; i < upSamples; ++i)
-            {
-                float x = up[i];
-                x *= drive;
-
-                float y = x;
-                switch (mode)
-                {
-                    case 0:
-                    {
-                        const int stages = 3;
-                        float acc = 0.0f;
-                        float s = 1.0f;
-                        for (int st = 0; st < stages; ++st)
-                        {
-                            const float thr = threshold * s;
-                            float folded = x;
-                            if (thr > 0.0f)
-                            {
-                                float pos = std::fmod(folded + thr, 2.0f * thr);
-                                if (pos < 0.0f) pos += 2.0f * thr;
-                                if (pos <= thr) folded = pos - thr;
-                                else folded = 3.0f * thr - pos;
-                            }
-                            acc += folded;
-                            s *= 2.0f;
-                        }
-                        y = acc / float(stages);
-                        break;
-                    }
-                    case 1:
-                    {
-                        const int stages = 4;
-                        float v = x;
-                        for (int st = 0; st < stages; ++st)
-                        {
-                            if (threshold > 0.0f)
-                            {
-                                float pos = std::fmod(v + threshold, 2.0f * threshold);
-                                if (pos < 0.0f) pos += 2.0f * threshold;
-                                if (pos <= threshold) v = pos - threshold;
-                                else v = 3.0f * threshold - pos;
-                            }
-                        }
-                        y = v;
-                        break;
-                    }
-                    case 2:
-                        y = juce::jlimit(-threshold, threshold, x);
-                        break;
-                    case 3:
-                    {
-                        if (std::fabs(x) < threshold)
-                            y = 0.0f;
-                        else
-                            y = x;
-                        break;
-                    }
-                    case 4:
-                    {
-                        float v = x;
-                        float s = 1.0f;
-                        for (int st = 0; st < 5; ++st)
-                        {
-                            float thr = threshold * s;
-                            if (thr > 0.0f)
-                            {
-                                float pos = std::fmod(v + thr, 2.0f * thr);
-                                if (pos < 0.0f) pos += 2.0f * thr;
-                                if (pos <= thr) v = pos - thr;
-                                else v = 3.0f * thr - pos;
-                            }
-                            s *= 0.5f;
-                        }
-                        y = v;
-                        break;
-                    }
-                    case 5:
-                    {
-                        if (threshold > 0.0f)
-                        {
-                            float m = std::fmod(x + threshold, 2.0f * threshold);
-                            if (m < 0.0f) m += 2.0f * threshold;
-                            y = m - threshold;
-                        }
-                        else y = x;
-                        break;
-                    }
-                    default:
-                    {
-                        if (threshold > 0.0f)
-                        {
-                            float pos = std::fmod(x + threshold, 2.0f * threshold);
-                            if (pos < 0.0f) pos += 2.0f * threshold;
-                            if (pos <= threshold) y = pos - threshold;
-                            else y = 3.0f * threshold - pos;
-                        }
-                    }
-                }
-                up[i] = y;
-            }
-        }
-
-        // downsample by simple averaging (box filter)
-        for (int ch = 0; ch < numChannels; ++ch)
-        {
-            float* out = buffer.getWritePointer(ch);
-            const float* up = upBuf.getReadPointer(ch);
-            float& dcFilter = dcFilters[size_t(ch)];
-
-            for (int i = 0; i < numSamples; ++i)
-            {
-                float sum = 0.0f;
-                for (int k = 0; k < factor; ++k)
-                    sum += up[i * factor + k];
-                float proc = sum / float(factor);
-
-                float outv = (1.0f - mix) * dry.getSample(ch, i) + mix * proc;
-
-                const float dcCoeff = 0.995f;
-                dcFilter = dcCoeff * dcFilter + outv;
-                outv -= dcFilter * (1.0f - dcCoeff);
-
-                out[i] = outv;
-            }
+            float* wet = buffer.getWritePointer(c);
+            const float* dry = dryBuf.getReadPointer(c);
+            for (int i = 0; i < numSamp; ++i)
+                wet[i] -= dry[i];
         }
     }
 }
 
-void SpectralWavefolderAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
+void SpectralWavefolderAudioProcessor::getStateInformation(juce::MemoryBlock& d)
 {
-    if (auto xml = parameters.copyState().createXml())
-        copyXmlToBinary(*xml, destData);
+    if (auto x = parameters.copyState().createXml())
+        copyXmlToBinary(*x, d);
 }
 
-void SpectralWavefolderAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
+void SpectralWavefolderAudioProcessor::setStateInformation(const void* d, int n)
 {
-    if (auto xml = getXmlFromBinary(data, sizeInBytes))
-        parameters.replaceState(juce::ValueTree::fromXml(*xml));
+    if (auto x = getXmlFromBinary(d, n))
+        parameters.replaceState(juce::ValueTree::fromXml(*x));
 }
 
 juce::AudioProcessorEditor* SpectralWavefolderAudioProcessor::createEditor()
